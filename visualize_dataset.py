@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import wandb
 
 
-WANDB_ENTITY = None
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", None)
 WANDB_PROJECT = "vis_rlds"
 
 
@@ -29,7 +29,8 @@ else:
 dataset_name = args.dataset_name
 print(f"Visualizing data from dataset: {dataset_name}")
 module = importlib.import_module(dataset_name)
-ds = tfds.load(dataset_name, split="train")
+DATA_DIR = os.environ.get("DATA_DIR")
+ds = tfds.load(dataset_name, split="train", data_dir=DATA_DIR)
 ds = ds.shuffle(100)
 
 # visualize episodes
@@ -37,8 +38,8 @@ for i, episode in enumerate(ds.take(5)):
     images = []
     for step in episode["steps"]:
         images.append(step["observation"]["image"].numpy())
-    image_strip = np.concatenate(images[::4], axis=1)
-    caption = step["language_instruction"].numpy().decode() + " (temp. downsampled 4x)"
+    image_strip = np.concatenate(images, axis=1)
+    caption = step["multimodal_instruction"].numpy().decode()
 
     if render_wandb:
         wandb.log({f"image_{i}": wandb.Image(image_strip, caption=caption)})
@@ -48,15 +49,15 @@ for i, episode in enumerate(ds.take(5)):
         plt.title(caption)
 
 # visualize action and state statistics
-actions, states = [], []
+actions = {}
 for episode in tqdm.tqdm(ds.take(500)):
     for step in episode["steps"]:
-        actions.append(step["action"].numpy())
-        states.append(step["observation"]["state"].numpy())
-actions = np.array(actions)
-states = np.array(states)
-action_mean = actions.mean(0)
-state_mean = states.mean(0)
+        for k, v in step["action"].items():
+            if k not in actions:
+                actions[k] = []
+            actions[k].append(v.numpy())
+actions = {k: np.array(v) for k, v in actions.items()}
+actions_mean = {k: v.mean(0) for k, v in actions.items()}
 
 
 def vis_stats(vector, vector_mean, tag):
@@ -75,8 +76,8 @@ def vis_stats(vector, vector_mean, tag):
         wandb.log({tag: wandb.Image(fig)})
 
 
-vis_stats(actions, action_mean, "action_stats")
-vis_stats(states, state_mean, "state_stats")
+for action in actions:
+    vis_stats(actions[action], actions_mean[action], f"action_stats_{action}")
 
 if not render_wandb:
     plt.show()

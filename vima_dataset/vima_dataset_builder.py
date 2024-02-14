@@ -1,3 +1,8 @@
+import resource
+
+low, high = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (high, high))
+
 from typing import Iterator, Tuple, Any
 import os
 import pickle
@@ -8,7 +13,7 @@ from PIL import Image
 import tensorflow as tf
 import tensorflow_hub as hub
 import tensorflow_datasets as tfds
-from vima.conversion_utils import MultiThreadedDatasetBuilder
+from vima_dataset.conversion_utils import MultiThreadedDatasetBuilder
 
 from einops import rearrange
 

@@ -11,6 +11,23 @@ import tensorflow_hub as hub
 from einops import rearrange
 
 
+TASK_MAPPING = {
+    "follow_order": "follow_order",
+    "manipulate_old_neighbor": "manipulate_old_neighbor",
+    "novel_adj": "novel_adj",
+    "novel_noun": "novel_noun",
+    "pick_in_order_then_restore": "pick_in_order_then_restore",
+    "rearrange": "rearrange",
+    "rearrange_then_restore": "rearrange_then_restore",
+    "rotate": "rotate",
+    "same_profile": "same_shape",
+    "scene_understanding": "scene_understanding",
+    "simple_manipulation": "visual_manipulation",
+    "sweep_without_exceeding": "sweep_without_exceeding",
+    "twist": "twist",
+}
+
+
 class VIMADataset(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for VIMA dataset."""
 
@@ -25,23 +42,6 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
             "https://tfhub.dev/google/universal-sentence-encoder-large/5"
         )
 
-        self._task_mapping = {
-            "follow_order": "follow_order",
-            "manipulate_old_neighbor": "manipulate_old_neighbor",
-            "novel_adj": "novel_adj",
-            "novel_noun": "novel_noun",
-            "pick_in_order_then_restore": "pick_in_order_then_restore",
-            "rearrange": "rearrange",
-            "rearrange_then_restore": "rearrange_then_restore",
-            "rotate": "rotate",
-            "same_profile": "same_shape",
-            "scene_understanding": "scene_understanding",
-            "simple_manipulation": "visual_manipulation",
-            "sweep_without_exceeding": "sweep_without_exceeding",
-            "twist": "twist",
-        }
-        self._views = ["top", "front"]
-
         # read data folder from environment variable
         self._raw_data_dir = os.environ.get("RAW_DATA_DIR", None)
         assert (
@@ -50,7 +50,7 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
         assert os.path.exists(
             self._raw_data_dir
         ), f"Data directory {self._raw_data_dir} does not exist."
-        for task_name in self._task_mapping:
+        for task_name in TASK_MAPPING:
             assert os.path.exists(
                 os.path.join(self._raw_data_dir, task_name)
             ), f"Task directory {task_name} does not exist."
@@ -315,10 +315,14 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
     def _generate_examples(self) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
 
-        def _parse_example(folder_path, new_task):
+        def _parse_example(episode_path):
+            """
+            episode_path: /path_to_data_dir/task_name/episode_id
+            """
+
             rgbs_all_views = {}
-            for view in self._views:
-                rgb_view_folder = os.path.join(folder_path, f"rgb_{view}")
+            for view in ["top", "front"]:
+                rgb_view_folder = os.path.join(episode_path, f"rgb_{view}")
                 n_frames = len(
                     [x for x in os.listdir(rgb_view_folder) if x.endswith(".jpg")]
                 )
@@ -331,10 +335,10 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
                     )
                     rgbs.append(img)  # list of (H, W, C)
                 rgbs_all_views[view] = rgbs
-            segm_and_ee = pickle.load(open(os.path.join(folder_path, "obs.pkl"), "rb"))
-            actions = pickle.load(open(os.path.join(folder_path, "action.pkl"), "rb"))
+            segm_and_ee = pickle.load(open(os.path.join(episode_path, "obs.pkl"), "rb"))
+            actions = pickle.load(open(os.path.join(episode_path, "action.pkl"), "rb"))
             traj_meta = pickle.load(
-                open(os.path.join(folder_path, "trajectory.pkl"), "rb")
+                open(os.path.join(episode_path, "trajectory.pkl"), "rb")
             )
 
             # construct some fields that are consistent across all steps
@@ -425,9 +429,13 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
                         ),
                     }
                 )
-            file_path = str(os.path.relpath(folder_path, self._raw_data_dir))
+            # get relative file path in the format of task_name/episode_id
+            task_name = os.path.basename(os.path.dirname(episode_path))
+            episode_id = os.path.basename(episode_path)
+            file_path = os.path.join(task_name, episode_id)
+
             episode_metadata = {
-                "task": new_task,
+                "task": TASK_MAPPING[task_name],
                 "file_path": file_path,
                 "action_bounds": {
                     "high": traj_meta["action_bounds"]["high"],
@@ -450,8 +458,9 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
             # if you want to skip an example for whatever reason, simply return None
             return file_path, sample
 
+        paths = []
         # loop over all tasks
-        for task_name, new_task_name in self._task_mapping.items():
+        for task_name in TASK_MAPPING:
             # list all folders
             all_folders = os.listdir(os.path.join(self._raw_data_dir, task_name))
             # trajectories are in folders with names that are integers
@@ -459,11 +468,7 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
             # loop over all trajectories
             for f_path in all_folders:
                 f_path = os.path.join(self._raw_data_dir, task_name, f_path)
-                yield _parse_example(f_path, new_task_name)
+                paths.append(f_path)
 
-        # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
-        # beam = tfds.core.lazy_imports.apache_beam
-        # return (
-        #         beam.Create(episode_paths)
-        #         | beam.Map(_parse_example)
-        # )
+        beam = tfds.core.lazy_imports.apache_beam
+        return beam.Create(paths) | beam.Map(_parse_example)

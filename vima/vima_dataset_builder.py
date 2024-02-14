@@ -6,24 +6,180 @@ from copy import deepcopy
 import numpy as np
 from PIL import Image
 import tensorflow as tf
-import tensorflow_datasets as tfds
 import tensorflow_hub as hub
+import tensorflow_datasets as tfds
+from vima.conversion_utils import MultiThreadedDatasetBuilder
+
 from einops import rearrange
 
 
-class VIMADataset(tfds.core.GeneratorBasedBuilder):
+def _generate_examples(self) -> Iterator[Tuple[str, Any]]:
+    """Generator of examples for each split."""
+
+    def _parse_example(folder_path, new_task):
+        rgbs_all_views = {}
+        for view in self._views:
+            rgb_view_folder = os.path.join(folder_path, f"rgb_{view}")
+            n_frames = len(
+                [x for x in os.listdir(rgb_view_folder) if x.endswith(".jpg")]
+            )
+            rgbs = []
+            for i in range(n_frames):
+                img = np.array(
+                    Image.open(os.path.join(rgb_view_folder, f"{i}.jpg")),
+                    copy=True,
+                    dtype=np.uint8,
+                )
+                rgbs.append(img)  # list of (H, W, C)
+            rgbs_all_views[view] = rgbs
+        segm_and_ee = pickle.load(open(os.path.join(folder_path, "obs.pkl"), "rb"))
+        actions = pickle.load(open(os.path.join(folder_path, "action.pkl"), "rb"))
+        traj_meta = pickle.load(open(os.path.join(folder_path, "trajectory.pkl"), "rb"))
+
+        # construct some fields that are consistent across all steps
+        # ====== segmentation_obj_info ======
+        obj_id_to_info = traj_meta.pop("obj_id_to_info")
+        segm_id, obj_name, texture_name = [], [], []
+        for k, v in obj_id_to_info.items():
+            segm_id.append(np.array(k, dtype=np.int64))
+            obj_name.append(v["obj_name"])
+            texture_name.append(v["texture_name"])
+        segmentation_obj_info = {
+            "segm_id": segm_id,
+            "obj_name": obj_name,
+            "texture_name": texture_name,
+        }
+
+        # ====== multimodal_instruction_assets ======
+        prompt_assets = traj_meta.pop("prompt_assets")
+        key_name, asset_type = [], []
+        images, frontal_images, segmentations, frontal_segmentations = (
+            [],
+            [],
+            [],
+            [],
+        )
+        prompt_segmentation_obj_info = []
+        for k, v in prompt_assets.items():
+            key_name.append(k)
+            asset_type.append(v["placeholder_type"])
+            images.append(rearrange(v["rgb"]["top"], "c h w -> h w c"))
+            frontal_images.append(rearrange(v["rgb"]["front"], "c h w -> h w c"))
+            segmentations.append(v["segm"]["top"])
+            frontal_segmentations.append(v["segm"]["front"])
+            obj_info = v["segm"]["obj_info"]
+            if v["placeholder_type"] == "object":
+                obj_info = [obj_info]
+            prompt_segmentation_obj_info.append(
+                {
+                    "segm_id": [
+                        np.array(each_obj_info["obj_id"], dtype=np.int64)
+                        for each_obj_info in obj_info
+                    ],
+                    "obj_name": [
+                        each_obj_info["obj_name"] for each_obj_info in obj_info
+                    ],
+                    "texture_name": [
+                        each_obj_info["obj_color"] for each_obj_info in obj_info
+                    ],
+                }
+            )
+        multimodal_instruction_assets = {
+            "key_name": key_name,
+            "asset_type": asset_type,
+            "image": images,
+            "frontal_image": frontal_images,
+            "segmentation": segmentations,
+            "frontal_segmentation": frontal_segmentations,
+            "segmentation_obj_info": prompt_segmentation_obj_info,
+        }
+
+        num_steps = traj_meta["steps"]
+        step_wise_data = []
+        for t in range(num_steps):
+            step_wise_data.append(
+                {
+                    "observation": {
+                        "image": rgbs_all_views["top"][t],
+                        "frontal_image": rgbs_all_views["front"][t],
+                        "segmentation": segm_and_ee["segm"]["top"][t],
+                        "frontal_segmentation": segm_and_ee["segm"]["front"][t],
+                        "segmentation_obj_info": deepcopy(segmentation_obj_info),
+                        "ee": segm_and_ee["ee"][t],
+                    },
+                    "action": {
+                        "pose0_position": actions["pose0_position"][t],
+                        "pose0_rotation": actions["pose0_rotation"][t],
+                        "pose1_position": actions["pose1_position"][t],
+                        "pose1_rotation": actions["pose1_rotation"][t],
+                    },
+                    "discount": 1.0,
+                    "reward": float(t == (num_steps - 1)),
+                    "is_first": t == 0,
+                    "is_last": t == (num_steps - 1),
+                    "is_terminal": t == (num_steps - 1),
+                    "multimodal_instruction": traj_meta["prompt"],
+                    "multimodal_instruction_assets": deepcopy(
+                        multimodal_instruction_assets
+                    ),
+                }
+            )
+        file_path = str(os.path.relpath(folder_path, self._raw_data_dir))
+        episode_metadata = {
+            "task": new_task,
+            "file_path": file_path,
+            "action_bounds": {
+                "high": traj_meta["action_bounds"]["high"],
+                "low": traj_meta["action_bounds"]["low"],
+            },
+            "end-effector type": traj_meta["end_effector_type"],
+            "failure": traj_meta["failure"],
+            "success": traj_meta["success"],
+            "n_objects": traj_meta["n_objects"],
+            "robot_components_seg_ids": [
+                np.array(x, dtype=np.int64) for x in traj_meta["robot_components"]
+            ],
+            "seed": traj_meta["seed"],
+            "num_steps": num_steps,
+        }
+
+        # create output data sample
+        sample = {"steps": step_wise_data, "episode_metadata": episode_metadata}
+
+        # if you want to skip an example for whatever reason, simply return None
+        return file_path, sample
+
+    # loop over all tasks
+    for task_name, new_task_name in self._task_mapping.items():
+        # list all folders
+        all_folders = os.listdir(os.path.join(self._raw_data_dir, task_name))
+        # trajectories are in folders with names that are integers
+        all_folders = [f for f in all_folders if f.isdigit()]
+        # loop over all trajectories
+        for f_path in all_folders:
+            f_path = os.path.join(self._raw_data_dir, task_name, f_path)
+            yield _parse_example(f_path, new_task_name)
+
+
+class VIMADataset(MultiThreadedDatasetBuilder):
     """DatasetBuilder for VIMA dataset."""
 
     VERSION = tfds.core.Version("1.0.0")
     RELEASE_NOTES = {
         "1.0.0": "Initial release.",
     }
+    N_WORKERS = 10  # number of parallel workers for data conversion
+    MAX_PATHS_IN_MEMORY = (
+        100  # number of paths converted & stored in memory before writing to disk
+    )
+    # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
+    # note that one path may yield multiple episodes and adjust accordingly
+    PARSE_FCN = (
+        _generate_examples  # handle to parse function from file paths to RLDS episodes
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._embed = hub.load(
-            "https://tfhub.dev/google/universal-sentence-encoder-large/5"
-        )
 
         self._task_mapping = {
             "follow_order": "follow_order",
@@ -309,161 +465,5 @@ class VIMADataset(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            "train": self._generate_examples(),
+            "train": type(self).PARSE_FCN(self),
         }
-
-    def _generate_examples(self) -> Iterator[Tuple[str, Any]]:
-        """Generator of examples for each split."""
-
-        def _parse_example(folder_path, new_task):
-            rgbs_all_views = {}
-            for view in self._views:
-                rgb_view_folder = os.path.join(folder_path, f"rgb_{view}")
-                n_frames = len(
-                    [x for x in os.listdir(rgb_view_folder) if x.endswith(".jpg")]
-                )
-                rgbs = []
-                for i in range(n_frames):
-                    img = np.array(
-                        Image.open(os.path.join(rgb_view_folder, f"{i}.jpg")),
-                        copy=True,
-                        dtype=np.uint8,
-                    )
-                    rgbs.append(img)  # list of (H, W, C)
-                rgbs_all_views[view] = rgbs
-            segm_and_ee = pickle.load(open(os.path.join(folder_path, "obs.pkl"), "rb"))
-            actions = pickle.load(open(os.path.join(folder_path, "action.pkl"), "rb"))
-            traj_meta = pickle.load(
-                open(os.path.join(folder_path, "trajectory.pkl"), "rb")
-            )
-
-            # construct some fields that are consistent across all steps
-            # ====== segmentation_obj_info ======
-            obj_id_to_info = traj_meta.pop("obj_id_to_info")
-            segm_id, obj_name, texture_name = [], [], []
-            for k, v in obj_id_to_info.items():
-                segm_id.append(np.array(k, dtype=np.int64))
-                obj_name.append(v["obj_name"])
-                texture_name.append(v["texture_name"])
-            segmentation_obj_info = {
-                "segm_id": segm_id,
-                "obj_name": obj_name,
-                "texture_name": texture_name,
-            }
-
-            # ====== multimodal_instruction_assets ======
-            prompt_assets = traj_meta.pop("prompt_assets")
-            key_name, asset_type = [], []
-            images, frontal_images, segmentations, frontal_segmentations = (
-                [],
-                [],
-                [],
-                [],
-            )
-            prompt_segmentation_obj_info = []
-            for k, v in prompt_assets.items():
-                key_name.append(k)
-                asset_type.append(v["placeholder_type"])
-                images.append(rearrange(v["rgb"]["top"], "c h w -> h w c"))
-                frontal_images.append(rearrange(v["rgb"]["front"], "c h w -> h w c"))
-                segmentations.append(v["segm"]["top"])
-                frontal_segmentations.append(v["segm"]["front"])
-                obj_info = v["segm"]["obj_info"]
-                if v["placeholder_type"] == "object":
-                    obj_info = [obj_info]
-                prompt_segmentation_obj_info.append(
-                    {
-                        "segm_id": [
-                            np.array(each_obj_info["obj_id"], dtype=np.int64)
-                            for each_obj_info in obj_info
-                        ],
-                        "obj_name": [
-                            each_obj_info["obj_name"] for each_obj_info in obj_info
-                        ],
-                        "texture_name": [
-                            each_obj_info["obj_color"] for each_obj_info in obj_info
-                        ],
-                    }
-                )
-            multimodal_instruction_assets = {
-                "key_name": key_name,
-                "asset_type": asset_type,
-                "image": images,
-                "frontal_image": frontal_images,
-                "segmentation": segmentations,
-                "frontal_segmentation": frontal_segmentations,
-                "segmentation_obj_info": prompt_segmentation_obj_info,
-            }
-
-            num_steps = traj_meta["steps"]
-            step_wise_data = []
-            for t in range(num_steps):
-                step_wise_data.append(
-                    {
-                        "observation": {
-                            "image": rgbs_all_views["top"][t],
-                            "frontal_image": rgbs_all_views["front"][t],
-                            "segmentation": segm_and_ee["segm"]["top"][t],
-                            "frontal_segmentation": segm_and_ee["segm"]["front"][t],
-                            "segmentation_obj_info": deepcopy(segmentation_obj_info),
-                            "ee": segm_and_ee["ee"][t],
-                        },
-                        "action": {
-                            "pose0_position": actions["pose0_position"][t],
-                            "pose0_rotation": actions["pose0_rotation"][t],
-                            "pose1_position": actions["pose1_position"][t],
-                            "pose1_rotation": actions["pose1_rotation"][t],
-                        },
-                        "discount": 1.0,
-                        "reward": float(t == (num_steps - 1)),
-                        "is_first": t == 0,
-                        "is_last": t == (num_steps - 1),
-                        "is_terminal": t == (num_steps - 1),
-                        "multimodal_instruction": traj_meta["prompt"],
-                        "multimodal_instruction_assets": deepcopy(
-                            multimodal_instruction_assets
-                        ),
-                    }
-                )
-            file_path = str(os.path.relpath(folder_path, self._raw_data_dir))
-            episode_metadata = {
-                "task": new_task,
-                "file_path": file_path,
-                "action_bounds": {
-                    "high": traj_meta["action_bounds"]["high"],
-                    "low": traj_meta["action_bounds"]["low"],
-                },
-                "end-effector type": traj_meta["end_effector_type"],
-                "failure": traj_meta["failure"],
-                "success": traj_meta["success"],
-                "n_objects": traj_meta["n_objects"],
-                "robot_components_seg_ids": [
-                    np.array(x, dtype=np.int64) for x in traj_meta["robot_components"]
-                ],
-                "seed": traj_meta["seed"],
-                "num_steps": num_steps,
-            }
-
-            # create output data sample
-            sample = {"steps": step_wise_data, "episode_metadata": episode_metadata}
-
-            # if you want to skip an example for whatever reason, simply return None
-            return file_path, sample
-
-        # loop over all tasks
-        for task_name, new_task_name in self._task_mapping.items():
-            # list all folders
-            all_folders = os.listdir(os.path.join(self._raw_data_dir, task_name))
-            # trajectories are in folders with names that are integers
-            all_folders = [f for f in all_folders if f.isdigit()]
-            # loop over all trajectories
-            for f_path in all_folders:
-                f_path = os.path.join(self._raw_data_dir, task_name, f_path)
-                yield _parse_example(f_path, new_task_name)
-
-        # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
-        # beam = tfds.core.lazy_imports.apache_beam
-        # return (
-        #         beam.Create(episode_paths)
-        #         | beam.Map(_parse_example)
-        # )
